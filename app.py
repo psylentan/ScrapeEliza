@@ -1,6 +1,6 @@
 import streamlit as st
 import json
-from scraper import WebScraper
+from enhanced_scraper import EnhancedWebScraper
 from urllib.parse import urlparse, quote, unquote
 import time
 from datetime import datetime
@@ -93,14 +93,15 @@ def process_urls(urls_text):
     
     return valid_urls, invalid_urls
 
-def run_scraper(urls, progress_bar, status_text):
+def run_scraper(urls, progress_bar, status_text, take_screenshots=True):
     """Run the scraper with progress updates"""
-    scraper = WebScraper()
+    scraper = EnhancedWebScraper()
     
     # Initialize new results
     results = {
         "scrape_timestamp": datetime.now().isoformat(),
         "total_urls_processed": len(urls),
+        "screenshots_enabled": take_screenshots,
         "pages": []
     }
     
@@ -108,7 +109,7 @@ def run_scraper(urls, progress_bar, status_text):
         status_text.text(f"Scraping: {url}")
         progress_bar.progress(i/len(urls))
         
-        page_data = scraper.scrape_url(url)
+        page_data = scraper.scrape_url(url, take_screenshots=take_screenshots)
         results["pages"].append(page_data)
         
         if i < len(urls):
@@ -156,26 +157,119 @@ def show_url_details(page_data):
     st.markdown(f"### [{page_data['url']}]({page_data['url']})")
     
     # Status
-    status = "✅ Success" if page_data["scrape_status"]["success"] else "❌ Failed"
+    status = "✅ Success" if page_data["status"]["success"] else "❌ Failed"
     st.markdown(f"**Status:** {status}")
     
     # Metadata
     with st.expander("📋 Metadata", expanded=True):
         st.markdown(f"**Title:** {page_data['metadata']['title']}")
-        if page_data['metadata']['description']:
-            st.markdown(f"**Description:** {page_data['metadata']['description']}")
-        if page_data['metadata']['h1']:
-            st.markdown(f"**H1:** {page_data['metadata']['h1']}")
+        if page_data['metadata']['meta_description']:
+            st.markdown(f"**Description:** {page_data['metadata']['meta_description']}")
+        if page_data['metadata']['meta_robots']:
+            st.markdown(f"**Robots:** {page_data['metadata']['meta_robots']}")
+        if page_data['metadata']['canonical']:
+            st.markdown(f"**Canonical URL:** {page_data['metadata']['canonical']}")
+        if page_data['metadata']['viewport']:
+            st.markdown(f"**Viewport:** {page_data['metadata']['viewport']}")
+        if page_data['headings']:
+            st.markdown("**Headings:**")
+            for heading in page_data['headings']:
+                st.markdown(f"• H{heading['level']}: {heading['text']} ({heading['word_count']} words)")
+    
+    # Screenshots
+    if page_data.get('screenshots'):
+        with st.expander("📸 Screenshots", expanded=True):
+            screenshots = page_data['screenshots']
+            if isinstance(screenshots, dict):
+                if 'status' in screenshots:
+                    if screenshots['status'] == 'disabled':
+                        st.info(screenshots.get('message', 'Screenshots were disabled for this scrape'))
+                    elif screenshots['status'] == 'failed':
+                        st.error(f"Screenshot error: {screenshots.get('message', 'Unknown error')}")
+                    else:
+                        # Display actual screenshots
+                        for view, screenshot in screenshots.items():
+                            if screenshot and isinstance(screenshot, str):
+                                st.markdown(f"**{view.title()} View:**")
+                                st.image(screenshot)
+            else:
+                st.error("Invalid screenshot data format")
     
     # Content
     with st.expander("📝 Content", expanded=False):
         st.markdown(f"**Word Count:** {page_data['content']['word_count']}")
         st.markdown("**Main Text:**")
-        st.markdown(page_data['content']['main_text'])
+        st.markdown(page_data['content']['clean_text'])
+    
+    # Images
+    if page_data.get('images'):
+        with st.expander("🖼️ Images", expanded=False):
+            for img in page_data['images']:
+                st.markdown(f"**Image:** {img['url']}")
+                st.markdown(f"• Alt: {img['alt']}")
+                if img['title']:
+                    st.markdown(f"• Title: {img['title']}")
+                if img['width'] and img['height']:
+                    st.markdown(f"• Dimensions: {img['width']}x{img['height']}")
+                if img['file_size']:
+                    st.markdown(f"• Size: {img['file_size']} bytes")
+                if img['format']:
+                    st.markdown(f"• Format: {img['format']}")
+    
+    # Links
+    if page_data.get('links'):
+        with st.expander("🔗 Links", expanded=False):
+            internal_links = [link for link in page_data['links'] if link['is_internal']]
+            external_links = [link for link in page_data['links'] if not link['is_internal']]
+            
+            st.markdown(f"**Internal Links ({len(internal_links)}):**")
+            for link in internal_links:
+                st.markdown(f"• [{link['anchor_text']}]({link['url']})")
+                if link['status_code']:
+                    st.markdown(f"  Status: {link['status_code']}")
+            
+            st.markdown(f"**External Links ({len(external_links)}):**")
+            for link in external_links:
+                st.markdown(f"• [{link['anchor_text']}]({link['url']})")
+                if link['is_nofollow']:
+                    st.markdown("  (nofollow)")
+    
+    # Technical Data
+    if page_data.get('technical'):
+        with st.expander("⚙️ Technical Data", expanded=False):
+            tech = page_data['technical']
+            st.markdown(f"**Load Time:** {tech['load_time']:.2f} seconds")
+            st.markdown(f"**Page Size:** {tech['page_size']:,} bytes")
+            st.markdown(f"**Status Code:** {tech['status_code']}")
+            st.markdown(f"**Content Type:** {tech['content_type']}")
+            
+            if tech['scripts']:
+                st.markdown("**Scripts:**")
+                for script in tech['scripts']:
+                    st.markdown(f"• {script}")
+            
+            if tech['stylesheets']:
+                st.markdown("**Stylesheets:**")
+                for css in tech['stylesheets']:
+                    st.markdown(f"• {css}")
+    
+    # Structured Data
+    if page_data.get('structured_data'):
+        with st.expander("🔍 Structured Data", expanded=False):
+            struct_data = page_data['structured_data']
+            if struct_data.get('schema_org'):
+                st.markdown("**Schema.org:**")
+                st.json(struct_data['schema_org'])
+            if struct_data.get('open_graph'):
+                st.markdown("**Open Graph:**")
+                st.json(struct_data['open_graph'])
+            if struct_data.get('twitter_cards'):
+                st.markdown("**Twitter Cards:**")
+                st.json(struct_data['twitter_cards'])
     
     # Analysis
     if page_data["analysis"].get("raw_analysis"):
-        with st.expander("🔍 Analysis", expanded=True):
+        with st.expander("🤖 AI Analysis", expanded=True):
             try:
                 analysis_data = json.loads(page_data["analysis"]["raw_analysis"])
                 
@@ -300,6 +394,9 @@ if st.session_state.urls:
 if st.session_state.urls:
     st.subheader("Scraping")
     
+    # Add screenshot option checkbox
+    take_screenshots = st.checkbox("Take screenshots", value=True, help="Enable to capture screenshots of pages (takes longer)")
+    
     if st.button("Start Scraping", disabled=st.session_state.is_scraping):
         st.session_state.is_scraping = True
         
@@ -307,7 +404,7 @@ if st.session_state.urls:
         status_text = st.empty()
         
         try:
-            results = run_scraper(st.session_state.urls, progress_bar, status_text)
+            results = run_scraper(st.session_state.urls, progress_bar, status_text, take_screenshots)
             st.session_state.results = results  # Update results in session state
             st.success("Scraping completed successfully!")
             st.rerun()  # Force a rerun to ensure the UI updates properly
@@ -336,7 +433,7 @@ if st.session_state.results:
     # Display list of titles with links to detail pages
     for page in filtered_pages:
         title = page["metadata"]["title"] or page["url"]
-        status_emoji = "✅" if page["scrape_status"]["success"] else "❌"
+        status_emoji = "✅" if page["status"]["success"] else "❌"
         
         col1, col2 = st.columns([4, 1])
         with col1:
