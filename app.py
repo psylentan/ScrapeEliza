@@ -31,7 +31,11 @@ def load_session(filename):
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            st.session_state.results = data
+            # Handle both old and new format
+            if isinstance(data, list):
+                st.session_state.results = {"pages": data}
+            else:
+                st.session_state.results = data
             st.session_state.current_session = filename
             return True
     except Exception as e:
@@ -94,34 +98,33 @@ def process_urls(urls_text):
     return valid_urls, invalid_urls
 
 def run_scraper(urls, progress_bar, status_text, take_screenshots=True):
-    """Run the scraper with progress updates"""
+    """Run the scraper on a list of URLs and return results."""
+    results = []
     scraper = EnhancedWebScraper()
     
-    # Initialize new results
-    results = {
-        "scrape_timestamp": datetime.now().isoformat(),
-        "total_urls_processed": len(urls),
-        "screenshots_enabled": take_screenshots,
-        "pages": []
-    }
+    # Get domain from first URL for the filename
+    domain = urlparse(urls[0]).netloc.replace('www.', '')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_file = f'scraped_{domain}_{timestamp}.json'
     
-    for i, url in enumerate(urls, 1):
-        status_text.text(f"Scraping: {url}")
-        progress_bar.progress(i/len(urls))
-        
-        page_data = scraper.scrape_url(url, take_screenshots=take_screenshots)
-        results["pages"].append(page_data)
-        
-        if i < len(urls):
-            time.sleep(2)
+    for i, url in enumerate(urls):
+        try:
+            progress_bar.progress((i) / len(urls))
+            status_text.text(f'Scraping {url}...')
+            
+            page_data = scraper.scrape_url(url, take_screenshots=take_screenshots)
+            results.append(page_data)
+            
+            # Save results after each successful scrape
+            with open(results_file, 'w', encoding='utf-8') as f:
+                json.dump({"pages": results}, f, indent=2, ensure_ascii=False)
+            
+        except Exception as e:
+            st.error(f'Error scraping {url}: {str(e)}')
     
-    # Save session and update session state
-    filename = save_session(urls, results)
-    if filename:
-        st.session_state.current_session = filename
-        st.session_state.results = results  # Make sure to update results in session state
-    
-    return results
+    progress_bar.progress(1.0)
+    status_text.text('Scraping completed!')
+    return {"pages": results}, results_file
 
 def encode_url(url):
     """Safely encode URL for query parameter"""
@@ -291,47 +294,159 @@ def show_url_details(page_data):
             except json.JSONDecodeError:
                 st.markdown(page_data["analysis"]["raw_analysis"])
 
+def show_page_details(page_data):
+    """Display detailed information about a scraped page."""
+    if not page_data:
+        st.warning("No page data selected")
+        return
+
+    # URL and basic info
+    st.header("Page Details")
+    url = page_data.get("url", "")
+    st.markdown(f"🔗 **URL**: [{url}]({url})")
+    
+    # Status information
+    status = page_data.get("status", {})
+    if status:
+        with st.expander("Status Information", expanded=True):
+            st.write("Success:", status.get("success", False))
+            st.write("Status Code:", status.get("status_code"))
+            st.write("Response Time:", f"{status.get('response_time', 0):.2f}s")
+            if status.get("error"):
+                st.error(f"Error: {status['error']}")
+
+    # Metadata
+    metadata = page_data.get("metadata", {})
+    if metadata:
+        with st.expander("Metadata", expanded=True):
+            st.write("Title:", metadata.get("title"))
+            st.write("Description:", metadata.get("description"))
+            st.write("Keywords:", metadata.get("keywords"))
+            st.write("Author:", metadata.get("author"))
+            st.write("Robots:", metadata.get("robots"))
+            st.write("Language:", metadata.get("language"))
+            st.write("Canonical:", metadata.get("canonical"))
+            st.write("Viewport:", metadata.get("viewport"))
+            
+            if metadata.get("hreflang"):
+                st.write("Hreflang Tags:")
+                for tag in metadata["hreflang"]:
+                    st.write(f"- {tag['lang']}: {tag['href']}")
+
+    # Technical Data
+    tech_data = page_data.get("technical_data", {})
+    if tech_data:
+        with st.expander("Technical Data", expanded=True):
+            st.write("Content Type:", tech_data.get("content_type"))
+            st.write("Charset:", tech_data.get("charset"))
+            st.write("Page Size:", f"{tech_data.get('page_size', 0) / 1024:.2f} KB")
+            st.write("Load Time:", f"{tech_data.get('load_time', 0):.2f}s")
+
+    # Screenshots
+    screenshots = page_data.get("screenshots", {})
+    if screenshots:
+        with st.expander("Screenshots", expanded=True):
+            for name, path in screenshots.items():
+                if os.path.exists(path):
+                    st.subheader(name.replace("_", " ").title())
+                    st.image(path)
+                else:
+                    st.warning(f"Screenshot not found: {path}")
+
+    # Images
+    images = page_data.get("images", [])
+    if images:
+        with st.expander("Images", expanded=True):
+            for img in images:
+                st.write("Source:", img.get("src"))
+                st.write("Alt Text:", img.get("alt"))
+                st.write("Size:", img.get("size"))
+                st.write("---")
+
+    # Links
+    links = page_data.get("links", {})
+    if links:
+        with st.expander("Links", expanded=True):
+            if links.get("internal"):
+                st.subheader("Internal Links")
+                for link in links["internal"]:
+                    st.write(link)
+            if links.get("external"):
+                st.subheader("External Links")
+                for link in links["external"]:
+                    st.write(link)
+
+    # Main Content
+    content = page_data.get("main_content")
+    if content:
+        with st.expander("Main Content", expanded=True):
+            st.markdown(content)
+
+    # Raw HTML (for debugging)
+    html = page_data.get("html")
+    if html:
+        with st.expander("Raw HTML", expanded=False):
+            st.code(html, language="html")
+
 # Main UI Logic
 query_params = st.query_params
 
-# Debug information
-if st.session_state.results:
+# Display debug info in sidebar
+if 'results' in st.session_state:
     st.sidebar.write("Debug Info:")
-    st.sidebar.write(f"Number of pages in results: {len(st.session_state.results['pages'])}")
-    if "url" in query_params:
-        st.sidebar.write(f"Selected URL param: {query_params['url']}")
-        decoded_url = decode_url(query_params["url"])
-        st.sidebar.write(f"Decoded URL: {decoded_url}")
-
-# If a specific URL is selected, show its details
-if "url" in query_params:
-    selected_url = decode_url(query_params["url"])
-    if selected_url and st.session_state.results:
-        found = False
-        for page in st.session_state.results["pages"]:
-            if page["url"] == selected_url:
-                show_url_details(page)
-                found = True
-                st.stop()
+    st.sidebar.write(f"\nNumber of pages in results: {len(st.session_state.results)}")
+    
+    # Get URL from query parameters if available
+    url_param = st.query_params.get('url', None)
+    if url_param:
+        st.sidebar.write(f"\nSelected URL param: {url_param}")
+        decoded_url = decode_url(url_param)
+        st.sidebar.write(f"\nDecoded URL: {decoded_url}")
         
-        if not found:
-            st.error(f"URL not found in results: {selected_url}")
-            st.sidebar.error("Debug: URL not found in results")
-            st.sidebar.write("Looking for:", selected_url)
-            st.sidebar.write("Available URLs:", [p["url"] for p in st.session_state.results["pages"]])
-    else:
-        if not selected_url:
-            st.error("Failed to decode URL parameter")
-        elif not st.session_state.results:
-            st.error("No results loaded")
-        
-    if st.button("← Back to List"):
-        st.query_params.clear()
-        st.rerun()
-    st.stop()
+        # Check if URL exists in results
+        urls_in_results = [page['url'] for page in st.session_state.results]
+        if decoded_url not in urls_in_results:
+            st.sidebar.write("\nDebug: URL not found in results")
+            st.sidebar.write(f"\nLooking for: {decoded_url}")
+            st.sidebar.write("\nAvailable URLs:")
+            st.sidebar.json([page['url'] for page in st.session_state.results])
+            st.sidebar.write(f"URL not found in results: {decoded_url}")
+        else:
+            page_data = next(page for page in st.session_state.results if page['url'] == decoded_url)
+            show_url_details(page_data)
 
 # Main list view
-st.title("URL Scraper & Analyzer 🔍")
+st.title("Scraped Pages")
+
+if 'results' in st.session_state and st.session_state.results:
+    # Get pages from results
+    results = st.session_state.results
+    if isinstance(results, dict):
+        pages = results.get("pages", [])
+    else:
+        pages = results if isinstance(results, list) else []
+    
+    # Create columns for the list
+    for page in pages:
+        with st.container():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                # Handle both string and dictionary page objects
+                if isinstance(page, dict):
+                    title = page.get('metadata', {}).get('title') or page.get('url', 'No Title')
+                    desc = page.get('metadata', {}).get('description', 'No description available')
+                else:
+                    title = str(page)
+                    desc = "No description available"
+                    
+                st.markdown(f"### {title}")
+                st.write(desc)
+            with col2:
+                if st.button("View Details", key=f"view_{title}"):
+                    st.session_state.selected_page = page
+            st.divider()
+else:
+    st.info("No pages have been scraped yet. Use the sidebar to start scraping.")
 
 # Session Management
 st.sidebar.header("Session Management")
@@ -404,7 +519,7 @@ if st.session_state.urls:
         status_text = st.empty()
         
         try:
-            results = run_scraper(st.session_state.urls, progress_bar, status_text, take_screenshots)
+            results, results_file = run_scraper(st.session_state.urls, progress_bar, status_text, take_screenshots)
             st.session_state.results = results  # Update results in session state
             st.success("Scraping completed successfully!")
             st.rerun()  # Force a rerun to ensure the UI updates properly
@@ -420,31 +535,42 @@ if st.session_state.results:
     # Quick search
     search = st.text_input("🔍 Quick search in titles", key="quick_search")
     
+    # Get pages from results
+    results = st.session_state.results
+    if isinstance(results, dict):
+        pages = results.get("pages", [])
+    else:
+        pages = results if isinstance(results, list) else []
+        
     # Filter pages based on search
-    filtered_pages = st.session_state.results["pages"]
     if search:
         search = search.lower()
-        filtered_pages = [
-            page for page in filtered_pages
-            if search in (page["metadata"]["title"] or page["url"]).lower()
-        ]
+        filtered_pages = []
+        for page in pages:
+            if isinstance(page, dict):
+                title = page.get("metadata", {}).get("title", "") or page.get("url", "")
+            else:
+                title = str(page)
+            if search in title.lower():
+                filtered_pages.append(page)
         st.info(f"Found {len(filtered_pages)} matching results")
+    else:
+        filtered_pages = pages
     
     # Display list of titles with links to detail pages
     for page in filtered_pages:
-        title = page["metadata"]["title"] or page["url"]
-        status_emoji = "✅" if page["status"]["success"] else "❌"
+        if isinstance(page, dict):
+            title = page.get("metadata", {}).get("title", "") or page.get("url", "")
+            status = page.get("status", {})
+            success = status.get("success", False) if isinstance(status, dict) else False
+            status_emoji = "✅" if success else "❌"
+        else:
+            title = str(page)
+            status_emoji = "❓"
         
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            # Create a link that sets the URL query parameter with proper encoding
-            encoded_url = encode_url(page['url'])
-            if encoded_url:
-                st.markdown(f"• [{title}](?url={encoded_url})")
-            else:
-                st.markdown(f"• {title} (URL encoding error)")
-        with col2:
-            st.markdown(f"{status_emoji}")
+        # Create a clickable link with the title
+        if st.button(f"{status_emoji} {title}", key=f"btn_{title}"):
+            st.session_state.selected_page = page
     
     # Simple download button
     st.download_button(
@@ -452,4 +578,8 @@ if st.session_state.results:
         data=json.dumps(st.session_state.results, ensure_ascii=False, indent=2),
         file_name=f"scraped_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json"
-    ) 
+    )
+
+# Display selected page details
+if st.session_state.get('selected_page'):
+    show_page_details(st.session_state.selected_page) 

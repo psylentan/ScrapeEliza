@@ -19,6 +19,10 @@ import base64
 from screenshot_manager import ScreenshotManager
 import openai
 from openai import OpenAI
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import random
+from urllib.robotparser import RobotFileParser
 
 # Load environment variables
 load_dotenv()
@@ -67,109 +71,185 @@ class EnhancedWebScraper:
         # Initialize other components first
         self.screenshot_manager = ScreenshotManager()
         
-        # Initialize OpenAI client with minimal configuration
+        # List of realistic user agents
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0'
+        ]
+        
+        # Common browser headers
+        self.browser_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'DNT': '1',  # Do Not Track
+            'Cache-Control': 'max-age=0'
+        }
+        
+        # Initialize requests session with retry strategy and timeouts
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # Configure retry strategy with exponential backoff
+        retry_strategy = Retry(
+            total=3,  # number of retries
+            backoff_factor=2,  # wait 2, 4, 8 seconds between retries
+            status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
+            allowed_methods=["GET", "HEAD", "OPTIONS"]  # Only retry on these methods
+        )
+        
+        # Create session with retry strategy
+        self.session = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Set default timeout (connect timeout, read timeout)
+        self.session.timeout = (15, 45)  # 15 seconds to connect, 45 seconds to read
+        
+        # Initialize robots.txt parser
+        self.robots_parser = RobotFileParser()
+        
+        # Track request history to implement rate limiting
+        self.last_request_time = {}  # Dictionary to track last request time per domain
+        self.min_request_interval = 5  # Minimum seconds between requests to the same domain
+        
+        # Initialize OpenAI client
         try:
             api_key = os.getenv('OPENAI_API_KEY')
-            logger.info(f"Found OpenAI API key: {'Yes' if api_key else 'No'}")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY environment variable is not set")
-            
-            # Create client with minimal configuration
-            from openai import OpenAI
             self.client = OpenAI(api_key=api_key)
-            logger.info("OpenAI client initialized successfully")
-            
-            # Create or retrieve the assistant
-            try:
-                self.assistant = self.client.beta.assistants.create(
-                    name="Web Content Analyzer",
-                    instructions="""You are a web content analyzer. Your task is to analyze webpage content and provide structured insights.
-                    
-                    Always respond in valid JSON format with the following structure:
-                    {
-                        "summary": "A concise summary of the main content",
-                        "target_audience": "Description of who this content is intended for",
-                        "key_takeaways": ["List of main points", "or takeaways"]
-                    }
-                    
-                    Keep your responses focused and structured. Ensure the JSON is properly formatted and all fields are present.""",
-                    model="gpt-4-turbo-preview"
-                )
-                logger.info(f"Assistant created with ID: {self.assistant.id}")
-            except Exception as e:
-                logger.error(f"Failed to create assistant: {str(e)}")
-                self.assistant = None
-            
+            self.assistant_id = "asst_pMeB1BJP8A7kwVSJQKTY1kSd"
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI client: {str(e)}")
             self.client = None
-            self.assistant = None
+            self.assistant_id = None
             
-        # Initialize requests session after OpenAI
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        self.base_url = None
-        self.session = requests.Session()
-    
-    def get_image_data(self, img_tag: BeautifulSoup, base_url: str) -> ImageData:
-        """Extract comprehensive image data including dimensions and file size."""
+    def get_random_user_agent(self):
+        """Get a random user agent from the list."""
+        return random.choice(self.user_agents)
+        
+    def get_request_headers(self, url):
+        """Get headers for a request with proper referrer and origin."""
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        headers = self.browser_headers.copy()
+        headers.update({
+            'User-Agent': self.get_random_user_agent(),
+            'Host': parsed_url.netloc,
+            'Origin': base_url,
+            'Referer': base_url
+        })
+        return headers
+        
+    def respect_robots_txt(self, url: str) -> bool:
+        """Check if we're allowed to scrape the URL according to robots.txt."""
         try:
+            parsed_url = urlparse(url)
+            robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
+            
+            # Use session with proper headers for robots.txt request
+            headers = self.get_request_headers(robots_url)
+            response = self.session.get(robots_url, headers=headers, timeout=(5, 10))
+            
+            if response.status_code == 200:
+                self.robots_parser.parse(response.text.splitlines())
+                return self.robots_parser.can_fetch("*", url)
+            return True
+        except Exception as e:
+            logger.warning(f"Error checking robots.txt: {str(e)}")
+            return True
+            
+    def respect_rate_limits(self, url: str):
+        """Implement rate limiting per domain."""
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        
+        current_time = time.time()
+        if domain in self.last_request_time:
+            time_since_last_request = current_time - self.last_request_time[domain]
+            if time_since_last_request < self.min_request_interval:
+                sleep_time = self.min_request_interval - time_since_last_request
+                logger.info(f"Rate limiting: Sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+                
+        # Add some random delay (2-7 seconds)
+        random_delay = random.uniform(2, 7)
+        time.sleep(random_delay)
+        
+        self.last_request_time[domain] = time.time()
+        
+    def get_image_data(self, img_tag: BeautifulSoup, base_url: str) -> ImageData:
+        """Extract image data from img tag."""
+        try:
+            # Skip tracking pixels and non-image URLs
             src = img_tag.get('src', '')
-            if not src:
+            if any(x in src.lower() for x in ['facebook.com/tr', 'pixel', 'tracking', 'analytics']):
                 return None
-
-            # Handle data URLs
+                
+            # Skip data URLs that aren't images
             if src.startswith('data:'):
-                # Extract dimensions from SVG viewBox if present
-                if 'svg' in src.lower():
-                    match = re.search(r'viewBox=[\'"]([^\'"]*)[\'"]', src)
-                    if match:
-                        try:
-                            _, _, width, height = map(float, match.group(1).split())
-                            return ImageData(
-                                url=src[:50] + '...',  # Truncate data URL
-                                alt=img_tag.get('alt', ''),
-                                title=img_tag.get('title'),
-                                width=int(width),
-                                height=int(height),
-                                file_size=len(src),
-                                format='SVG',
-                                is_data_url=True
-                            )
-                        except:
-                            pass
+                if not src.startswith('data:image/'):
+                    return None
+                    
+            # Skip empty or invalid URLs
+            if not src or src.startswith('javascript:'):
+                return None
+                
+            # Handle relative URLs
+            if not src.startswith(('http://', 'https://', 'data:')):
+                src = urljoin(base_url, src)
+                
+            # Get image dimensions
+            width = img_tag.get('width')
+            height = img_tag.get('height')
+            
+            # Get alt text and title
+            alt = img_tag.get('alt', '')
+            title = img_tag.get('title')
+            
+            # For data URLs, we already have the image data
+            if src.startswith('data:'):
                 return ImageData(
-                    url=src[:50] + '...',  # Truncate data URL
-                    alt=img_tag.get('alt', ''),
-                    title=img_tag.get('title'),
-                    width=None,
-                    height=None,
-                    file_size=len(src),
-                    format=src.split(';')[0].split('/')[1] if ';' in src else None,
+                    url=src,
+                    alt=alt,
+                    title=title,
+                    width=width,
+                    height=height,
                     is_data_url=True
                 )
-
-            # Handle regular URLs
-            img_url = urljoin(base_url, src)
-            response = self.session.get(img_url, stream=True)
-            if response.status_code != 200:
-                return None
-
-            img = Image.open(BytesIO(response.content))
             
-            return ImageData(
-                url=img_url,
-                alt=img_tag.get('alt', ''),
-                title=img_tag.get('title'),
-                width=img.width,
-                height=img.height,
-                file_size=len(response.content),
-                format=img.format,
-                is_data_url=False
-            )
+            # For regular URLs, fetch the image
+            try:
+                response = self.session.get(src, timeout=(5, 10))
+                if response.status_code == 200:
+                    img_data = BytesIO(response.content)
+                    img = Image.open(img_data)
+                    return ImageData(
+                        url=src,
+                        alt=alt,
+                        title=title,
+                        width=width or img.width,
+                        height=height or img.height,
+                        file_size=len(response.content),
+                        format=img.format
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to process image {src}: {str(e)}")
+                return None
+                
         except Exception as e:
-            logger.warning(f"Failed to process image {src}: {str(e)}")
+            logger.warning(f"Error processing image tag: {str(e)}")
             return None
 
     def get_link_data(self, link_tag: BeautifulSoup, base_url: str) -> LinkData:
@@ -239,100 +319,75 @@ class EnhancedWebScraper:
             logger.warning(f"Failed to extract structured data: {str(e)}")
             return None
 
-    def analyze_content(self, url: str, content: str, metadata: Dict) -> Dict:
-        """Analyze content using OpenAI's API"""
-        if not self.client or not self.assistant:
-            logger.warning("OpenAI client or assistant not initialized, skipping content analysis")
-            return {
-                "raw_analysis": "OpenAI client not initialized. Please check your API key."
-            }
+    def analyze_content(self, url: str, html_content: str, metadata: Dict) -> Dict:
+        """Analyze content using OpenAI API with rate limiting."""
+        if not self.client or not self.assistant_id:
+            return {"error": "OpenAI client not initialized"}
             
         try:
-            logger.info("Starting content analysis with OpenAI Assistant...")
-            
             # Create a thread
             thread = self.client.beta.threads.create()
-            logger.info(f"Created thread: {thread.id}")
             
-            # Prepare the message with content and metadata
-            message_content = f"""
-            Please analyze this webpage content and provide a structured analysis in JSON format with the following fields:
-            - summary: A brief summary of the main content
-            - target_audience: Who this content is intended for
-            - key_takeaways: List of main points or takeaways
-            
-            URL: {url}
-            
-            Metadata:
-            Title: {metadata.get('title', 'N/A')}
-            Description: {metadata.get('meta_description', 'N/A')}
-            
-            Page Content:
-            {content[:2000]}
-            """
-            
-            # Add a message to the thread
-            message = self.client.beta.threads.messages.create(
+            # Add the content as a message
+            self.client.beta.threads.messages.create(
                 thread_id=thread.id,
                 role="user",
-                content=message_content
+                content=html_content
             )
-            logger.info("Added message to thread")
             
             # Run the assistant
             run = self.client.beta.threads.runs.create(
                 thread_id=thread.id,
-                assistant_id=self.assistant.id
+                assistant_id=self.assistant_id
             )
-            logger.info(f"Started assistant run: {run.id}")
             
-            # Wait for the run to complete
+            # Poll for completion with delay
             while True:
                 run_status = self.client.beta.threads.runs.retrieve(
                     thread_id=thread.id,
                     run_id=run.id
                 )
+                
                 if run_status.status == 'completed':
                     break
-                elif run_status.status in ['failed', 'cancelled', 'expired']:
-                    raise Exception(f"Assistant run failed with status: {run_status.status}")
-                time.sleep(1)
+                elif run_status.status == 'failed':
+                    return {"error": "Analysis failed"}
+                    
+                time.sleep(1)  # Add delay between polls
             
-            # Get the assistant's response
+            # Get the response
             messages = self.client.beta.threads.messages.list(
                 thread_id=thread.id
             )
             
-            # Get the latest assistant response
-            for msg in messages:
-                if msg.role == "assistant":
-                    response_text = msg.content[0].text.value
-                    try:
-                        # Try to parse as JSON
-                        analysis_data = json.loads(response_text)
-                        logger.info("Successfully parsed analysis as JSON")
-                        return {
-                            "raw_analysis": analysis_data
-                        }
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to parse analysis as JSON, returning as plain text")
-                        return {
-                            "raw_analysis": response_text
-                        }
+            # Clean up
+            self.client.beta.threads.delete(thread.id)
             
-            raise Exception("No assistant response found")
+            return {"analysis": messages.data[0].content[0].text.value}
             
         except Exception as e:
-            logger.error(f"Error analyzing content: {str(e)}")
-            return {
-                "raw_analysis": f"Analysis failed: {str(e)}"
-            }
+            logger.error(f"Error in content analysis: {str(e)}")
+            return {"error": str(e)}
 
     def scrape_url(self, url: str, take_screenshots: bool = True) -> Dict:
-        """Enhanced scraping with comprehensive data extraction."""
+        """Enhanced scraping with comprehensive data extraction and safety measures."""
         try:
+            # Check robots.txt first
+            if not self.respect_robots_txt(url):
+                return {
+                    "url": url,
+                    "status": {"success": False, "error": "Access denied by robots.txt"},
+                    "error": "Access denied by robots.txt"
+                }
+                
             logger.info(f"Scraping: {url}")
             start_time = time.time()
+            
+            # Respect rate limits
+            self.respect_rate_limits(url)
+            
+            # Get proper headers for this request
+            headers = self.get_request_headers(url)
             
             # Take screenshots first (with error handling)
             screenshots = {}
@@ -352,9 +407,31 @@ class EnhancedWebScraper:
                     "message": "Screenshots were disabled for this scrape"
                 }
             
-            # Fetch page
-            response = self.session.get(url, headers=self.headers)
-            response.raise_for_status()
+            # Fetch page with updated headers
+            try:
+                response = self.session.get(url, headers=headers, timeout=self.session.timeout)
+                response.raise_for_status()
+            except requests.exceptions.Timeout:
+                logger.error(f"✗ Timeout while scraping {url}")
+                return {
+                    "url": url,
+                    "status": {"success": False, "error": "Request timed out"},
+                    "error": "Request timed out"
+                }
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"✗ Connection error while scraping {url}: {str(e)}")
+                return {
+                    "url": url,
+                    "status": {"success": False, "error": "Connection error"},
+                    "error": str(e)
+                }
+            except requests.exceptions.RequestException as e:
+                logger.error(f"✗ Error scraping {url}: {str(e)}")
+                return {
+                    "url": url,
+                    "status": {"success": False, "error": "Request failed"},
+                    "error": str(e)
+                }
             
             # Parse HTML
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -362,9 +439,12 @@ class EnhancedWebScraper:
 
             # Basic metadata
             metadata = {
-                'title': soup.title.string if soup.title else None,
-                'meta_description': soup.find('meta', {'name': 'description'})['content'] if soup.find('meta', {'name': 'description'}) else None,
-                'meta_robots': soup.find('meta', {'name': 'robots'})['content'] if soup.find('meta', {'name': 'robots'}) else None,
+                'title': soup.title.string.strip() if soup.title else None,
+                'description': soup.find('meta', {'name': 'description'})['content'] if soup.find('meta', {'name': 'description'}) else None,
+                'robots': soup.find('meta', {'name': 'robots'})['content'] if soup.find('meta', {'name': 'robots'}) else None,
+                'keywords': soup.find('meta', {'name': 'keywords'})['content'] if soup.find('meta', {'name': 'keywords'}) else None,
+                'author': soup.find('meta', {'name': 'author'})['content'] if soup.find('meta', {'name': 'author'}) else None,
+                'language': soup.find('html').get('lang') if soup.find('html') else None,
                 'canonical': soup.find('link', {'rel': 'canonical'})['href'] if soup.find('link', {'rel': 'canonical'}) else None,
                 'hreflang': [{'href': tag['href'], 'lang': tag['hreflang']} for tag in soup.find_all('link', {'rel': 'alternate', 'hreflang': True})],
                 'viewport': soup.find('meta', {'name': 'viewport'})['content'] if soup.find('meta', {'name': 'viewport'}) else None,
