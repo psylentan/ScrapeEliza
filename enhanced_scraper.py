@@ -17,12 +17,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import base64
 from screenshot_manager import ScreenshotManager
-import openai
 from openai import OpenAI
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import random
-from urllib.robotparser import RobotFileParser
+import anthropic
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -67,189 +64,136 @@ class StructuredData:
     json_ld: List[Dict]
 
 class EnhancedWebScraper:
-    def __init__(self):
-        # Initialize other components first
-        self.screenshot_manager = ScreenshotManager()
-        
-        # List of realistic user agents
-        self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0'
-        ]
-        
-        # Common browser headers
-        self.browser_headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'DNT': '1',  # Do Not Track
-            'Cache-Control': 'max-age=0'
+    def __init__(self, enable_analysis=False, enable_screenshots=False):
+        self.enable_analysis = enable_analysis
+        self.enable_screenshots = enable_screenshots
+        if enable_analysis:
+            self.anthropic_client = anthropic.Anthropic(
+                api_key=os.getenv('ANTHROPIC_API_KEY')
+            )
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        
-        # Initialize requests session with retry strategy and timeouts
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        
-        # Configure retry strategy with exponential backoff
-        retry_strategy = Retry(
-            total=3,  # number of retries
-            backoff_factor=2,  # wait 2, 4, 8 seconds between retries
-            status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
-            allowed_methods=["GET", "HEAD", "OPTIONS"]  # Only retry on these methods
-        )
-        
-        # Create session with retry strategy
+        self.base_url = None
         self.session = requests.Session()
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        # Set default timeout (connect timeout, read timeout)
-        self.session.timeout = (15, 45)  # 15 seconds to connect, 45 seconds to read
-        
-        # Initialize robots.txt parser
-        self.robots_parser = RobotFileParser()
-        
-        # Track request history to implement rate limiting
-        self.last_request_time = {}  # Dictionary to track last request time per domain
-        self.min_request_interval = 5  # Minimum seconds between requests to the same domain
-        
-        # Initialize OpenAI client
+        if enable_screenshots:
+            self.screenshot_manager = ScreenshotManager()
+        else:
+            self.screenshot_manager = None
+    
+    def analyze_content(self, url: str, content: str) -> Dict:
+        """Analyze content using Anthropic's Claude API."""
         try:
-            api_key = os.getenv('OPENAI_API_KEY')
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable is not set")
-            self.client = OpenAI(api_key=api_key)
-            self.assistant_id = "asst_pMeB1BJP8A7kwVSJQKTY1kSd"
+            logger.info("Analyzing content with Anthropic's Claude...")
+            
+            prompt = f"""Analyze this webpage content and provide:
+            1. A brief summary (2-3 sentences)
+            2. The target audience
+            3. Key takeaways (3-5 bullet points)
+            4. Content quality score (1-10)
+            5. SEO recommendations (if any)
+
+            URL: {url}
+
+            Content:
+            {content[:3000]}
+            
+            Format your response as JSON with the following structure:
+            {{
+                "summary": "...",
+                "target_audience": "...",
+                "key_takeaways": ["...", "..."],
+                "quality_score": N,
+                "seo_recommendations": ["...", "..."]
+            }}
+            """
+
+            message = self.anthropic_client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=1000,
+                temperature=0,
+                system="You are an expert content analyst. Analyze web content and provide insights in JSON format.",
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # Parse the response as JSON
+            try:
+                analysis = json.loads(message.content[0].text)
+                logger.info("✓ Content analyzed successfully")
+                return {
+                    "raw_analysis": json.dumps(analysis, ensure_ascii=False, indent=2)
+                }
+            except json.JSONDecodeError:
+                return {
+                    "raw_analysis": message.content[0].text
+                }
+            
         except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {str(e)}")
-            self.client = None
-            self.assistant_id = None
-            
-    def get_random_user_agent(self):
-        """Get a random user agent from the list."""
-        return random.choice(self.user_agents)
-        
-    def get_request_headers(self, url):
-        """Get headers for a request with proper referrer and origin."""
-        parsed_url = urlparse(url)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        headers = self.browser_headers.copy()
-        headers.update({
-            'User-Agent': self.get_random_user_agent(),
-            'Host': parsed_url.netloc,
-            'Origin': base_url,
-            'Referer': base_url
-        })
-        return headers
-        
-    def respect_robots_txt(self, url: str) -> bool:
-        """Check if we're allowed to scrape the URL according to robots.txt."""
-        try:
-            parsed_url = urlparse(url)
-            robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
-            
-            # Use session with proper headers for robots.txt request
-            headers = self.get_request_headers(robots_url)
-            response = self.session.get(robots_url, headers=headers, timeout=(5, 10))
-            
-            if response.status_code == 200:
-                self.robots_parser.parse(response.text.splitlines())
-                return self.robots_parser.can_fetch("*", url)
-            return True
-        except Exception as e:
-            logger.warning(f"Error checking robots.txt: {str(e)}")
-            return True
-            
-    def respect_rate_limits(self, url: str):
-        """Implement rate limiting per domain."""
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-        
-        current_time = time.time()
-        if domain in self.last_request_time:
-            time_since_last_request = current_time - self.last_request_time[domain]
-            if time_since_last_request < self.min_request_interval:
-                sleep_time = self.min_request_interval - time_since_last_request
-                logger.info(f"Rate limiting: Sleeping for {sleep_time:.2f} seconds")
-                time.sleep(sleep_time)
-                
-        # Add some random delay (2-7 seconds)
-        random_delay = random.uniform(2, 7)
-        time.sleep(random_delay)
-        
-        self.last_request_time[domain] = time.time()
-        
+            logger.error(f"Error during content analysis: {str(e)}")
+            return {
+                "raw_analysis": f"Analysis failed: {str(e)}"
+            }
+
     def get_image_data(self, img_tag: BeautifulSoup, base_url: str) -> ImageData:
-        """Extract image data from img tag."""
+        """Extract comprehensive image data including dimensions and file size."""
         try:
-            # Skip tracking pixels and non-image URLs
             src = img_tag.get('src', '')
-            if any(x in src.lower() for x in ['facebook.com/tr', 'pixel', 'tracking', 'analytics']):
+            if not src:
                 return None
-                
-            # Skip data URLs that aren't images
+
+            # Handle data URLs
             if src.startswith('data:'):
-                if not src.startswith('data:image/'):
-                    return None
-                    
-            # Skip empty or invalid URLs
-            if not src or src.startswith('javascript:'):
-                return None
-                
-            # Handle relative URLs
-            if not src.startswith(('http://', 'https://', 'data:')):
-                src = urljoin(base_url, src)
-                
-            # Get image dimensions
-            width = img_tag.get('width')
-            height = img_tag.get('height')
-            
-            # Get alt text and title
-            alt = img_tag.get('alt', '')
-            title = img_tag.get('title')
-            
-            # For data URLs, we already have the image data
-            if src.startswith('data:'):
+                # Extract dimensions from SVG viewBox if present
+                if 'svg' in src.lower():
+                    match = re.search(r'viewBox=[\'"]([^\'"]*)[\'"]', src)
+                    if match:
+                        try:
+                            _, _, width, height = map(float, match.group(1).split())
+                            return ImageData(
+                                url=src[:50] + '...',  # Truncate data URL
+                                alt=img_tag.get('alt', ''),
+                                title=img_tag.get('title'),
+                                width=int(width),
+                                height=int(height),
+                                file_size=len(src),
+                                format='SVG',
+                                is_data_url=True
+                            )
+                        except:
+                            pass
                 return ImageData(
-                    url=src,
-                    alt=alt,
-                    title=title,
-                    width=width,
-                    height=height,
+                    url=src[:50] + '...',  # Truncate data URL
+                    alt=img_tag.get('alt', ''),
+                    title=img_tag.get('title'),
+                    width=None,
+                    height=None,
+                    file_size=len(src),
+                    format=src.split(';')[0].split('/')[1] if ';' in src else None,
                     is_data_url=True
                 )
-            
-            # For regular URLs, fetch the image
-            try:
-                response = self.session.get(src, timeout=(5, 10))
-                if response.status_code == 200:
-                    img_data = BytesIO(response.content)
-                    img = Image.open(img_data)
-                    return ImageData(
-                        url=src,
-                        alt=alt,
-                        title=title,
-                        width=width or img.width,
-                        height=height or img.height,
-                        file_size=len(response.content),
-                        format=img.format
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to process image {src}: {str(e)}")
+
+            # Handle regular URLs
+            img_url = urljoin(base_url, src)
+            response = self.session.get(img_url, stream=True)
+            if response.status_code != 200:
                 return None
-                
+
+            img = Image.open(BytesIO(response.content))
+            
+            return ImageData(
+                url=img_url,
+                alt=img_tag.get('alt', ''),
+                title=img_tag.get('title'),
+                width=img.width,
+                height=img.height,
+                file_size=len(response.content),
+                format=img.format,
+                is_data_url=False
+            )
         except Exception as e:
-            logger.warning(f"Error processing image tag: {str(e)}")
+            logger.warning(f"Failed to process image {src}: {str(e)}")
             return None
 
     def get_link_data(self, link_tag: BeautifulSoup, base_url: str) -> LinkData:
@@ -319,399 +263,116 @@ class EnhancedWebScraper:
             logger.warning(f"Failed to extract structured data: {str(e)}")
             return None
 
-    def analyze_content(self, url: str, html_content: str, metadata: Dict) -> Dict:
-        """Analyze content using Claude API."""
+    def scrape_url(self, url: str) -> Dict:
+        """Enhanced scraping with comprehensive data extraction."""
         try:
-            import anthropic
-            
-            # Initialize Claude client
-            client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-            
-            # Format the message with metadata and request
-            message_content = f"""Please analyze this webpage content:
-
-URL: {url}
-Title: {metadata.get('title', 'N/A')}
-Description: {metadata.get('description', 'N/A')}
-Keywords: {metadata.get('keywords', 'N/A')}
-Author: {metadata.get('author', 'N/A')}
-Language: {metadata.get('language', 'N/A')}
-Robots: {metadata.get('robots', 'N/A')}
-Canonical URL: {metadata.get('canonical', 'N/A')}
-Viewport: {metadata.get('viewport', 'N/A')}
-
-Link Information:
-{json.dumps([{
-    'url': link.get('url', ''),
-    'anchor_text': link.get('anchor_text', ''),
-    'is_internal': link.get('is_internal', False)
-} for link in metadata.get('links', [])], indent=2)}
-
-Structured Data:
-Schema.org: {json.dumps(metadata.get('structured_data', {}).get('schema_org', []), indent=2)}
-Open Graph: {json.dumps(metadata.get('structured_data', {}).get('open_graph', []), indent=2)}
-Twitter Cards: {json.dumps(metadata.get('structured_data', {}).get('twitter_cards', {}), indent=2)}
-Microdata: {json.dumps(metadata.get('structured_data', {}).get('microdata', []), indent=2)}
-RDFa: {json.dumps(metadata.get('structured_data', {}).get('rdfa', []), indent=2)}
-JSON-LD: {json.dumps(metadata.get('structured_data', {}).get('json_ld', []), indent=2)}
-
-Content:
-{html_content}
-
-Please provide a detailed analysis of the page content, including:
-1. Main topics and themes
-2. Key information and important points
-3. Content quality and structure
-4. SEO analysis (meta tags, headings, etc.)
-5. Technical aspects (load time, page size, etc.)
-6. Content organization (headings, paragraphs, etc.)
-7. Media usage (images, their context and relevance)
-8. Link structure and navigation
-9. Any notable patterns or issues
-10. Recommendations for improvement
-
-Please format your response as a JSON object with the following structure:
-{
-    "summary": "Brief summary of the page content",
-    "target_audience": "Description of the target audience",
-    "key_takeaways": ["List of key points"],
-    "seo_analysis": "Analysis of SEO elements",
-    "technical_analysis": "Analysis of technical aspects",
-    "content_quality": "Analysis of content quality",
-    "recommendations": ["List of improvement recommendations"]
-}"""
-            
-            # Create message with Claude
-            message = client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=4000,
-                temperature=0.7,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": message_content
-                    }
-                ]
-            )
-            
-            # Extract the response
-            response_text = message.content[0].text
-            
-            try:
-                # Try to parse as JSON
-                analysis_data = json.loads(response_text)
-                return {
-                    "raw_analysis": analysis_data,
-                    "status": "success"
-                }
-            except json.JSONDecodeError:
-                # If not JSON, return as plain text
-                return {
-                    "raw_analysis": response_text,
-                    "status": "success"
-                }
-                
-        except Exception as e:
-            logger.error(f"Error during content analysis: {str(e)}")
-            return {
-                "error": str(e),
-                "status": "error"
-            }
-
-    def scrape_url(self, url: str, take_screenshots: bool = True, analyze_content: bool = True) -> Dict:
-        """Enhanced scraping with comprehensive data extraction and safety measures."""
-        try:
-            # Check robots.txt first
-            if not self.respect_robots_txt(url):
-                return {
-                    "url": url,
-                    "status": {"success": False, "error": "Access denied by robots.txt"},
-                    "error": "Access denied by robots.txt"
-                }
-                
             logger.info(f"Scraping: {url}")
-            start_time = time.time()
-            
-            # Respect rate limits
-            self.respect_rate_limits(url)
-            
-            # Get proper headers for this request
-            headers = self.get_request_headers(url)
-            
-            # Take screenshots first (with error handling)
-            screenshots = {
-                "status": "disabled",
-                "message": "Screenshots were disabled for this scrape"
-            }
-            if take_screenshots:
-                try:
-                    logger.info("Taking screenshots...")
-                    screenshots = self.screenshot_manager.take_screenshots(url)
-                    if not screenshots.get("status"):
-                        screenshots["status"] = "success"
-                    if not screenshots.get("paths"):
-                        screenshots["paths"] = {}
-                except Exception as e:
-                    logger.warning(f"Failed to take screenshots: {str(e)}")
-                    screenshots = {
-                        "error": str(e),
-                        "status": "failed",
-                        "paths": {}
-                    }
-            
-            # Fetch page with updated headers
-            try:
-                response = self.session.get(url, headers=headers, timeout=self.session.timeout)
-                response.raise_for_status()
-            except requests.exceptions.Timeout:
-                logger.error(f"✗ Timeout while scraping {url}")
-                return {
-                    "url": url,
-                    "status": {"success": False, "error": "Request timed out"},
-                    "error": "Request timed out"
-                }
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"✗ Connection error while scraping {url}: {str(e)}")
-                return {
-                    "url": url,
-                    "status": {"success": False, "error": "Connection error"},
-                    "error": str(e)
-                }
-            except requests.exceptions.RequestException as e:
-                logger.error(f"✗ Error scraping {url}: {str(e)}")
-                return {
-                    "url": url,
-                    "status": {"success": False, "error": "Request failed"},
-                    "error": str(e)
-                }
-            
-            # Parse HTML
-            soup = BeautifulSoup(response.text, 'html.parser')
-            self.base_url = url
+            response = self.session.get(url, headers=self.headers)
+            response.raise_for_status()
+            html = response.text
+            soup = BeautifulSoup(html, 'html.parser')
+            self.base_url = get_base_url(html, url)
 
-            # Basic metadata with safer extraction
-            try:
-                # Get title with proper encoding
-                title = soup.title.string.strip() if soup.title else None
-                if title:
-                    title = title.encode('utf-8', errors='ignore').decode('utf-8')
+            # Take screenshots if enabled
+            screenshots = {}
+            if self.enable_screenshots:
+                logger.info("Taking screenshots...")
+                screenshots = self.screenshot_manager.take_screenshots(url)
 
-                # Get meta tags with proper encoding
-                description = soup.find('meta', {'name': 'description'})
-                description = description.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if description else None
-
-                robots = soup.find('meta', {'name': 'robots'})
-                robots = robots.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if robots else None
-
-                keywords = soup.find('meta', {'name': 'keywords'})
-                keywords = keywords.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if keywords else None
-
-                author = soup.find('meta', {'name': 'author'})
-                author = author.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if author else None
-
-                language = soup.find('html').get('lang') if soup.find('html') else None
-                if language:
-                    language = language.encode('utf-8', errors='ignore').decode('utf-8')
-
-                canonical = soup.find('link', {'rel': 'canonical'})
-                canonical = canonical.get('href', '').encode('utf-8', errors='ignore').decode('utf-8') if canonical else None
-
-                viewport = soup.find('meta', {'name': 'viewport'})
-                viewport = viewport.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if viewport else None
-
-                hreflang = []
-                for tag in soup.find_all('link', {'rel': 'alternate', 'hreflang': True}):
-                    href = tag.get('href', '').encode('utf-8', errors='ignore').decode('utf-8')
-                    lang = tag.get('hreflang', '').encode('utf-8', errors='ignore').decode('utf-8')
-                    hreflang.append({'href': href, 'lang': lang})
-
-                metadata = {
-                    'title': title,
-                    'description': description,
-                    'robots': robots,
-                    'keywords': keywords,
-                    'author': author,
-                    'language': language,
-                    'canonical': canonical,
-                    'viewport': viewport,
-                    'hreflang': hreflang
-                }
-            except Exception as e:
-                logger.error(f"Error extracting metadata: {str(e)}")
-                metadata = {
-                    'title': None,
-                    'description': None,
-                    'robots': None,
-                    'keywords': None,
-                    'author': None,
-                    'language': None,
-                    'canonical': None,
-                    'viewport': None,
-                    'hreflang': []
-                }
-
-            # Extract headings
-            headings = []
-            for level in range(1, 7):
-                for heading in soup.find_all(f'h{level}'):
-                    text = heading.get_text(strip=True)
-                    headings.append(HeadingData(
-                        level=level,
-                        text=text,
-                        word_count=len(text.split())
-                    ))
-
-            # Extract images
-            images = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [
-                    executor.submit(self.get_image_data, img, url)
-                    for img in soup.find_all('img')
-                ]
-                images = [f.result() for f in futures if f.result()]
-
-            # Extract links
-            links = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [
-                    executor.submit(self.get_link_data, link, url)
-                    for link in soup.find_all('a')
-                ]
-                links = [f.result() for f in futures if f.result()]
-
-            # Extract structured data
-            structured_data = self.get_structured_data(response.text, url)
-
-            # Technical data
-            technical = {
-                'load_time': time.time() - start_time,
-                'page_size': len(response.content),
-                'status_code': response.status_code,
-                'content_type': response.headers.get('content-type'),
-                'scripts': [script['src'] for script in soup.find_all('script', src=True)],
-                'stylesheets': [css['href'] for css in soup.find_all('link', rel='stylesheet')],
+            # Extract metadata and content
+            metadata = {
+                'title': soup.title.string if soup.title else None,
+                'description': soup.find('meta', {'name': 'description'})['content'] if soup.find('meta', {'name': 'description'}) else '',
+                'h1': soup.h1.text if soup.h1 else None
             }
 
-            # Extract main content with better cleaning
-            try:
-                # Remove unwanted elements
-                for element in soup.find_all(['script', 'style', 'nav', 'footer', 'header']):
-                    element.decompose()
-                
-                # Get the main content
-                main_content = soup.find('main') or soup.find('article') or soup.find('div', {'class': 'content'}) or soup.find('body')
-                if main_content:
-                    content_text = main_content.get_text(separator=' ', strip=True)
-                else:
-                    content_text = soup.get_text(separator=' ', strip=True)
-                
-                # Clean the text and handle encoding
-                content_text = re.sub(r'\s+', ' ', content_text)  # Replace multiple spaces with single space
-                content_text = content_text.strip()
-                
-                # Ensure proper encoding for Hebrew text
-                content_text = content_text.encode('utf-8', errors='ignore').decode('utf-8')
-                
-                # Count words
-                word_count = len(content_text.split())
-                
-                content = {
-                    "clean_text": content_text,
-                    "word_count": word_count
-                }
-            except Exception as e:
-                logger.error(f"Error extracting content: {str(e)}")
-                content = {
-                    "clean_text": "",
-                    "word_count": 0
-                }
+            # Extract main content
+            main_content = ' '.join([p.text for p in soup.find_all('p')])
+            max_length = int(os.getenv('MAX_CONTENT_LENGTH', 2000))
+            if len(main_content) > max_length:
+                main_content = main_content[:max_length] + '...'
 
-            # Content analysis with better error handling
-            analysis = {}
-            if analyze_content and content.get("clean_text"):
-                try:
-                    analysis = self.analyze_content(url, content["clean_text"], metadata)
-                except Exception as e:
-                    logger.error(f"Error during content analysis: {str(e)}")
-                    analysis = {
-                        "error": str(e),
-                        "status": "error"
-                    }
+            # Run analysis if enabled
+            if self.enable_analysis:
+                analysis = self.analyze_content(url, main_content)
             else:
                 analysis = {
-                    "status": "disabled",
-                    "message": "Content analysis was disabled for this scrape"
+                    "raw_analysis": "Content analysis not enabled"
                 }
 
-            # Create the enhanced page data structure
+            # Create the page data structure
             page_data = {
                 "url": url,
-                "scrape_timestamp": datetime.now().isoformat(),
                 "metadata": metadata,
-                "content": content,
-                "headings": [asdict(h) for h in headings],
-                "images": [asdict(img) for img in images],
-                "links": [asdict(link) for link in links],
-                "structured_data": asdict(structured_data) if structured_data else {},
-                "technical": technical,
-                "status": {
-                    "success": True,
-                    "message": "Successfully scraped"
+                "content": {
+                    "main_text": main_content,
+                    "word_count": len(main_content.split())
                 },
-                "screenshots": screenshots,
+                "scrape_status": {
+                    "success": True,
+                    "timestamp": datetime.now().isoformat()
+                },
                 "analysis": analysis
             }
+
+            # Add screenshots if they were taken
+            if screenshots:
+                page_data["screenshots"] = screenshots
 
             logger.info(f"✓ Successfully scraped {url}")
             return page_data
 
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"✗ Error scraping {url}: {error_msg}")
+            logger.error(f"✗ Error scraping URL: {str(e)}")
             return {
                 "url": url,
-                "scrape_timestamp": datetime.now().isoformat(),
-                "status": {
+                "metadata": {},
+                "content": {},
+                "scrape_status": {
                     "success": False,
-                    "message": error_msg
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
                 },
-                "screenshots": {
-                    "status": "failed",
-                    "message": "Screenshots not available due to scraping error"
-                },
-                "analysis": {
-                    "raw_analysis": f"Analysis failed: {error_msg}"
-                }
+                "analysis": {},
+                "screenshots": {}
             }
 
-def main():
-    # Initialize scraper
-    scraper = EnhancedWebScraper()
-    
+def main(enable_analysis=False, enable_screenshots=False):
     # Read URLs from file
     with open('urls.txt', 'r', encoding='utf-8') as f:
         urls = [line.strip() for line in f if line.strip()]
     
+    scraper = EnhancedWebScraper(enable_analysis=enable_analysis, enable_screenshots=enable_screenshots)
+    
+    output_file = 'enhanced_scrape_results.json'
+    
     # Initialize results
     results = {
         "scrape_timestamp": datetime.now().isoformat(),
-        "total_urls": len(urls),
+        "total_urls_processed": len(urls),
         "pages": []
     }
     
     # Process each URL
-    for url in urls:
+    for i, url in enumerate(urls, 1):
+        logger.info(f"\nProcessing URL {i} of {len(urls)}")
         page_data = scraper.scrape_url(url)
         results["pages"].append(page_data)
         
         # Save after each URL
-        with open('enhanced_scrape_results.json', 'w', encoding='utf-8') as f:
+        with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
-        # Respect rate limiting
-        time.sleep(int(os.getenv('SCRAPE_DELAY', 2)))
+        if i < len(urls):
+            delay = int(os.getenv('SCRAPE_DELAY', 2))
+            logger.info(f"Waiting {delay} seconds before next URL...")
+            time.sleep(delay)
     
-    logger.info("✓ Scraping completed!")
+    logger.info(f"\n✓ Scraping completed! Results saved to {output_file}")
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser(description='Enhanced web scraper with optional features')
+    parser.add_argument('--analyze', action='store_true', help='Enable OpenAI content analysis')
+    parser.add_argument('--screenshots', action='store_true', help='Enable screenshot capture')
+    args = parser.parse_args()
+    main(enable_analysis=args.analyze, enable_screenshots=args.screenshots) 
