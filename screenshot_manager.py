@@ -30,51 +30,56 @@ class ScreenshotManager:
 
     def take_screenshots(self, url: str) -> dict:
         """Take screenshots of a URL at different resolutions."""
-        screenshots = {}
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        domain = url.replace("https://", "").replace("http://", "").split("/")[0]
-        
-        driver = webdriver.Chrome(options=self.chrome_options)
         try:
-            for device, (width, height) in self.RESOLUTIONS.items():
-                # Set window size
-                driver.set_window_size(width, height)
-                
-                # Navigate to URL
-                driver.get(url)
-                
-                # Wait for page to load
-                WebDriverWait(driver, 10).until(
-                    lambda driver: driver.execute_script('return document.readyState') == 'complete'
-                )
-                
-                # Additional wait for dynamic content
-                driver.implicitly_wait(2)
-                
-                # Create filename
-                filename = f"{domain}_{device}_{timestamp}.png"
-                filepath = os.path.join(self.output_dir, filename)
-                
-                # Take screenshot of full page
-                total_height = driver.execute_script("return document.body.scrollHeight")
-                driver.set_window_size(width, total_height)
-                driver.save_screenshot(filepath)
-                
-                # Store screenshot info
-                screenshots[device] = {
-                    "filename": filename,
-                    "path": filepath,
-                    "resolution": {
-                        "width": width,
-                        "height": height
-                    },
-                    "timestamp": timestamp
-                }
-                
-        finally:
-            driver.quit()
-        
-        return screenshots
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+            
+            driver = webdriver.Chrome(options=self.chrome_options)
+            paths = {}
+            
+            try:
+                for device, (width, height) in self.RESOLUTIONS.items():
+                    # Set window size
+                    driver.set_window_size(width, height)
+                    
+                    # Navigate to URL
+                    driver.get(url)
+                    
+                    # Wait for page to load
+                    WebDriverWait(driver, 10).until(
+                        lambda driver: driver.execute_script('return document.readyState') == 'complete'
+                    )
+                    
+                    # Additional wait for dynamic content
+                    driver.implicitly_wait(2)
+                    
+                    # Create filename
+                    filename = f"{domain}_{device}_{timestamp}.png"
+                    filepath = os.path.join(self.output_dir, filename)
+                    
+                    # Take screenshot of full page
+                    total_height = driver.execute_script("return document.body.scrollHeight")
+                    driver.set_window_size(width, total_height)
+                    driver.save_screenshot(filepath)
+                    
+                    # Store screenshot path
+                    paths[device] = filepath
+                    
+            finally:
+                driver.quit()
+            
+            return {
+                "status": "success",
+                "paths": paths,
+                "message": f"Successfully captured {len(paths)} screenshots"
+            }
+            
+        except Exception as e:
+            return {
+                "status": "failed",
+                "error": str(e),
+                "paths": {}
+            }
 
 def main():
     # Test the screenshot manager

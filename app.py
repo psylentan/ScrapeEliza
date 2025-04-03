@@ -7,6 +7,7 @@ from datetime import datetime
 import base64
 import glob
 import os
+from typing import List, Dict
 
 st.set_page_config(
     page_title="URL Scraper & Analyzer",
@@ -46,11 +47,17 @@ def load_session(filename):
 if 'urls' not in st.session_state:
     st.session_state.urls = []
 if 'results' not in st.session_state:
-    st.session_state.results = None
+    st.session_state.results = []
 if 'is_scraping' not in st.session_state:
     st.session_state.is_scraping = False
 if 'current_session' not in st.session_state:
     st.session_state.current_session = None
+if 'selected_page' not in st.session_state:
+    st.session_state.selected_page = None
+if 'results_file' not in st.session_state:
+    st.session_state.results_file = None
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = None
 
 # Auto-load most recent session if no session is loaded
 if st.session_state.results is None:
@@ -97,34 +104,18 @@ def process_urls(urls_text):
     
     return valid_urls, invalid_urls
 
-def run_scraper(urls, progress_bar, status_text, take_screenshots=True):
-    """Run the scraper on a list of URLs and return results."""
-    results = []
-    scraper = EnhancedWebScraper()
-    
-    # Get domain from first URL for the filename
-    domain = urlparse(urls[0]).netloc.replace('www.', '')
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    results_file = f'scraped_{domain}_{timestamp}.json'
-    
-    for i, url in enumerate(urls):
-        try:
-            progress_bar.progress((i) / len(urls))
-            status_text.text(f'Scraping {url}...')
-            
-            page_data = scraper.scrape_url(url, take_screenshots=take_screenshots)
-            results.append(page_data)
-            
-            # Save results after each successful scrape
-            with open(results_file, 'w', encoding='utf-8') as f:
-                json.dump({"pages": results}, f, indent=2, ensure_ascii=False)
-            
-        except Exception as e:
-            st.error(f'Error scraping {url}: {str(e)}')
-    
-    progress_bar.progress(1.0)
-    status_text.text('Scraping completed!')
-    return {"pages": results}, results_file
+def run_scraper(url, take_screenshots=True, analyze_content=True):
+    """Run the scraper on a single URL and return results."""
+    try:
+        scraper = EnhancedWebScraper()
+        result = scraper.scrape_url(url, take_screenshots=take_screenshots, analyze_content=analyze_content)
+        return result
+    except Exception as e:
+        return {
+            "url": url,
+            "error": str(e),
+            "status": {"success": False, "error": str(e)}
+        }
 
 def encode_url(url):
     """Safely encode URL for query parameter"""
@@ -180,23 +171,22 @@ def show_url_details(page_data):
                 st.markdown(f"• H{heading['level']}: {heading['text']} ({heading['word_count']} words)")
     
     # Screenshots
-    if page_data.get('screenshots'):
-        with st.expander("📸 Screenshots", expanded=True):
-            screenshots = page_data['screenshots']
-            if isinstance(screenshots, dict):
-                if 'status' in screenshots:
-                    if screenshots['status'] == 'disabled':
-                        st.info(screenshots.get('message', 'Screenshots were disabled for this scrape'))
-                    elif screenshots['status'] == 'failed':
-                        st.error(f"Screenshot error: {screenshots.get('message', 'Unknown error')}")
+    screenshots = page_data.get('screenshots', {})
+    if screenshots:
+        with st.expander("Screenshots", expanded=True):
+            if screenshots.get("status") == "success":
+                for name, path in screenshots.get("paths", {}).items():
+                    if os.path.exists(path):
+                        st.subheader(name.replace("_", " ").title())
+                        st.image(path)
                     else:
-                        # Display actual screenshots
-                        for view, screenshot in screenshots.items():
-                            if screenshot and isinstance(screenshot, str):
-                                st.markdown(f"**{view.title()} View:**")
-                                st.image(screenshot)
+                        st.warning(f"Screenshot not found: {path}")
+            elif screenshots.get("status") == "disabled":
+                st.info("Screenshots were disabled for this scrape")
+            elif screenshots.get("status") == "failed":
+                st.error(f"Screenshots failed: {screenshots.get('error', 'Unknown error')}")
             else:
-                st.error("Invalid screenshot data format")
+                st.warning("Screenshot status unknown")
     
     # Content
     with st.expander("📝 Content", expanded=False):
@@ -311,7 +301,7 @@ def show_page_details(page_data):
         with st.expander("Status Information", expanded=True):
             st.write("Success:", status.get("success", False))
             st.write("Status Code:", status.get("status_code"))
-            st.write("Response Time:", f"{status.get('response_time', 0):.2f}s")
+            st.write("Response Time:", f'{status.get("response_time", 0):.2f}s')
             if status.get("error"):
                 st.error(f"Error: {status['error']}")
 
@@ -334,251 +324,307 @@ def show_page_details(page_data):
                     st.write(f"- {tag['lang']}: {tag['href']}")
 
     # Technical Data
-    tech_data = page_data.get("technical_data", {})
+    tech_data = page_data.get("technical", {})
     if tech_data:
         with st.expander("Technical Data", expanded=True):
             st.write("Content Type:", tech_data.get("content_type"))
-            st.write("Charset:", tech_data.get("charset"))
             st.write("Page Size:", f"{tech_data.get('page_size', 0) / 1024:.2f} KB")
             st.write("Load Time:", f"{tech_data.get('load_time', 0):.2f}s")
+            if tech_data.get("scripts"):
+                st.write("Scripts:")
+                for script in tech_data["scripts"]:
+                    st.write(f"- {script}")
+            if tech_data.get("stylesheets"):
+                st.write("Stylesheets:")
+                for css in tech_data["stylesheets"]:
+                    st.write(f"- {css}")
 
     # Screenshots
     screenshots = page_data.get("screenshots", {})
     if screenshots:
         with st.expander("Screenshots", expanded=True):
-            for name, path in screenshots.items():
-                if os.path.exists(path):
-                    st.subheader(name.replace("_", " ").title())
-                    st.image(path)
-                else:
-                    st.warning(f"Screenshot not found: {path}")
+            if screenshots.get("status") == "success":
+                for name, path in screenshots.get("paths", {}).items():
+                    if os.path.exists(path):
+                        st.subheader(name.replace("_", " ").title())
+                        st.image(path)
+                    else:
+                        st.warning(f"Screenshot not found: {path}")
+            elif screenshots.get("status") == "disabled":
+                st.info("Screenshots were disabled for this scrape")
+            elif screenshots.get("status") == "failed":
+                st.error(f"Screenshots failed: {screenshots.get('error', 'Unknown error')}")
+            else:
+                st.warning("Screenshot status unknown")
 
     # Images
     images = page_data.get("images", [])
     if images:
         with st.expander("Images", expanded=True):
             for img in images:
-                st.write("Source:", img.get("src"))
+                st.write("Source:", img.get("url"))
                 st.write("Alt Text:", img.get("alt"))
-                st.write("Size:", img.get("size"))
+                if img.get("title"):
+                    st.write("Title:", img.get("title"))
+                if img.get("width") and img.get("height"):
+                    st.write(f"Dimensions: {img.get('width')}x{img.get('height')}")
+                if img.get("file_size"):
+                    st.write(f"Size: {img.get('file_size') / 1024:.2f} KB")
+                if img.get("format"):
+                    st.write("Format:", img.get("format"))
                 st.write("---")
 
     # Links
-    links = page_data.get("links", {})
+    links = page_data.get("links", [])
     if links:
         with st.expander("Links", expanded=True):
-            if links.get("internal"):
+            internal_links = [link for link in links if link.get("is_internal")]
+            external_links = [link for link in links if not link.get("is_internal")]
+            
+            if internal_links:
                 st.subheader("Internal Links")
-                for link in links["internal"]:
-                    st.write(link)
-            if links.get("external"):
+                for link in internal_links:
+                    st.write(f"URL: {link.get('url')}")
+                    st.write(f"Anchor Text: {link.get('anchor_text')}")
+                    st.write(f"Nofollow: {link.get('is_nofollow', False)}")
+                    st.write(f"Status: {link.get('status_code')}")
+                    st.write("---")
+            
+            if external_links:
                 st.subheader("External Links")
-                for link in links["external"]:
-                    st.write(link)
+                for link in external_links:
+                    st.write(f"URL: {link.get('url')}")
+                    st.write(f"Anchor Text: {link.get('anchor_text')}")
+                    st.write(f"Nofollow: {link.get('is_nofollow', False)}")
+                    st.write(f"Status: {link.get('status_code')}")
+                    st.write("---")
 
-    # Main Content
-    content = page_data.get("main_content")
+    # Content
+    content = page_data.get("content", {})
     if content:
-        with st.expander("Main Content", expanded=True):
-            st.markdown(content)
+        with st.expander("Content", expanded=True):
+            st.write("Word Count:", content.get("word_count"))
+            st.write("Clean Text:")
+            st.write(content.get("clean_text"))
 
-    # Raw HTML (for debugging)
-    html = page_data.get("html")
-    if html:
-        with st.expander("Raw HTML", expanded=False):
-            st.code(html, language="html")
+    # Structured Data
+    structured_data = page_data.get("structured_data", {})
+    if structured_data:
+        with st.expander("Structured Data", expanded=True):
+            if structured_data.get("schema_org"):
+                st.subheader("Schema.org")
+                st.json(structured_data["schema_org"])
+            if structured_data.get("open_graph"):
+                st.subheader("Open Graph")
+                st.json(structured_data["open_graph"])
+            if structured_data.get("twitter_cards"):
+                st.subheader("Twitter Cards")
+                st.json(structured_data["twitter_cards"])
+            if structured_data.get("microdata"):
+                st.subheader("Microdata")
+                st.json(structured_data["microdata"])
+            if structured_data.get("rdfa"):
+                st.subheader("RDFa")
+                st.json(structured_data["rdfa"])
+            if structured_data.get("json_ld"):
+                st.subheader("JSON-LD")
+                st.json(structured_data["json_ld"])
+
+    # Headings
+    headings = page_data.get("headings", [])
+    if headings:
+        with st.expander("Headings", expanded=True):
+            for heading in headings:
+                st.write(f"**H{heading.get('level')}**: {heading.get('text')}")
+                st.write(f"Word Count: {heading.get('word_count')}")
+                st.write("---")
+
+    # Analysis
+    analysis = page_data.get("analysis", {})
+    if analysis:
+        with st.expander("AI Analysis", expanded=True):
+            if analysis.get("raw_analysis"):
+                st.write(analysis["raw_analysis"])
+            if analysis.get("status") == "failed":
+                st.error(f"Analysis failed: {analysis.get('error', 'Unknown error')}")
+            elif analysis.get("status") == "timeout":
+                st.warning("Analysis timed out")
+
+def save_scrape_results(results: List[Dict], domain: str):
+    """Save scrape results to a JSON file with timestamp."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"scrape_results_{domain}_{timestamp}.json"
+    
+    # Create results directory if it doesn't exist
+    os.makedirs("scrape_results", exist_ok=True)
+    filepath = os.path.join("scrape_results", filename)
+    
+    # Save results
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    return filepath
+
+def get_most_recent_scrape():
+    """Get the most recent scrape results file."""
+    results_dir = "scrape_results"
+    if not os.path.exists(results_dir):
+        return None
+        
+    # Get all JSON files in the results directory
+    json_files = [f for f in os.listdir(results_dir) if f.endswith('.json')]
+    if not json_files:
+        return None
+        
+    # Sort by modification time, newest first
+    latest_file = max(json_files, key=lambda x: os.path.getmtime(os.path.join(results_dir, x)))
+    return os.path.join(results_dir, latest_file)
+
+def load_scrape_results(filepath: str) -> List[Dict]:
+    """Load scrape results from a JSON file."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading results: {str(e)}")
+        return []
 
 # Main UI Logic
 query_params = st.query_params
 
-# Display debug info in sidebar
-if 'results' in st.session_state:
-    st.sidebar.write("Debug Info:")
-    st.sidebar.write(f"\nNumber of pages in results: {len(st.session_state.results)}")
-    
-    # Get URL from query parameters if available
-    url_param = st.query_params.get('url', None)
-    if url_param:
-        st.sidebar.write(f"\nSelected URL param: {url_param}")
-        decoded_url = decode_url(url_param)
-        st.sidebar.write(f"\nDecoded URL: {decoded_url}")
-        
-        # Check if URL exists in results
-        urls_in_results = [page['url'] for page in st.session_state.results]
-        if decoded_url not in urls_in_results:
-            st.sidebar.write("\nDebug: URL not found in results")
-            st.sidebar.write(f"\nLooking for: {decoded_url}")
-            st.sidebar.write("\nAvailable URLs:")
-            st.sidebar.json([page['url'] for page in st.session_state.results])
-            st.sidebar.write(f"URL not found in results: {decoded_url}")
+# Initialize session state
+if 'results' not in st.session_state:
+    st.session_state.results = []
+if 'results_file' not in st.session_state:
+    st.session_state.results_file = None
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = None
+
+# Load most recent scrape if available
+if not st.session_state.results:
+    latest_file = get_most_recent_scrape()
+    if latest_file:
+        st.session_state.results = load_scrape_results(latest_file)
+        st.session_state.results_file = latest_file
+        st.info(f"Loaded most recent scrape from: {latest_file}")
+
+# Sidebar for loading previous scrapes
+with st.sidebar:
+    st.header("Previous Scrapes")
+    results_dir = "scrape_results"
+    if os.path.exists(results_dir):
+        json_files = [f for f in os.listdir(results_dir) if f.endswith('.json')]
+        if json_files:
+            # Sort by modification time, newest first
+            json_files.sort(key=lambda x: os.path.getmtime(os.path.join(results_dir, x)), reverse=True)
+            
+            for file in json_files:
+                filepath = os.path.join(results_dir, file)
+                if st.button(f"Load: {file}", key=f"load_{file}"):
+                    st.session_state.results = load_scrape_results(filepath)
+                    st.session_state.results_file = filepath
+                    st.success(f"Loaded scrape from: {file}")
         else:
-            page_data = next(page for page in st.session_state.results if page['url'] == decoded_url)
-            show_url_details(page_data)
-
-# Main list view
-st.title("Scraped Pages")
-
-if 'results' in st.session_state and st.session_state.results:
-    # Get pages from results
-    results = st.session_state.results
-    if isinstance(results, dict):
-        pages = results.get("pages", [])
+            st.info("No previous scrapes found")
     else:
-        pages = results if isinstance(results, list) else []
+        st.info("No previous scrapes found")
+
+# Main content area
+st.title("Web Scraper")
+
+# URL input section
+with st.expander("Enter URLs to Scrape", expanded=True):
+    urls_input = st.text_area(
+        "Enter URLs (one per line):",
+        value="",
+        height=150,
+        help="Enter one URL per line. The scraper will process each URL in sequence."
+    )
     
-    # Create columns for the list
-    for page in pages:
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        process_button = st.button("Process URLs")
+    with col2:
+        if process_button:
+            urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+            if urls:
+                st.success(f"Found {len(urls)} valid URLs to process")
+            else:
+                st.warning("No valid URLs found")
+
+# Scraping options
+with st.expander("Scraping Options", expanded=True):
+    take_screenshots = st.checkbox("Take Screenshots", value=True)
+    analyze_content = st.checkbox("Analyze Content", value=True)
+    
+    if st.button("Start Scraping", disabled=not urls_input.strip()):
+        with st.spinner("Scraping in progress..."):
+            # Process URLs
+            urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+            if not urls:
+                st.warning("No valid URLs to process")
+            else:
+                results = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, url in enumerate(urls):
+                    try:
+                        status_text.text(f"Processing: {url}")
+                        progress_bar.progress((i + 1) / len(urls))
+                        
+                        result = run_scraper(url, take_screenshots, analyze_content)
+                        results.append(result)
+                    except Exception as e:
+                        st.error(f"Error processing {url}: {str(e)}")
+                        results.append({
+                            "url": url,
+                            "error": str(e),
+                            "status": {"success": False, "error": str(e)}
+                        })
+                
+                # Update session state with results
+                st.session_state.results = results
+                
+                # Save results
+                if results:
+                    domain = urlparse(results[0]["url"]).netloc
+                    results_file = save_scrape_results(results, domain)
+                    st.session_state.results_file = results_file
+                    st.success(f"Results saved to: {results_file}")
+                
+                status_text.text("Scraping completed!")
+                progress_bar.progress(1.0)
+
+# Display results
+if st.session_state.results:
+    st.header("Scraping Results")
+    
+    # Search box
+    search_query = st.text_input("Search results:", "")
+    
+    # Filter results based on search
+    filtered_results = st.session_state.results
+    if search_query:
+        filtered_results = [
+            result for result in st.session_state.results
+            if search_query.lower() in result.get("url", "").lower() or
+               search_query.lower() in result.get("metadata", {}).get("title", "").lower() or
+               search_query.lower() in result.get("metadata", {}).get("description", "").lower()
+        ]
+    
+    # Display results in a list
+    for result in filtered_results:
         with st.container():
             col1, col2 = st.columns([3, 1])
             with col1:
-                # Handle both string and dictionary page objects
-                if isinstance(page, dict):
-                    title = page.get('metadata', {}).get('title') or page.get('url', 'No Title')
-                    desc = page.get('metadata', {}).get('description', 'No description available')
-                else:
-                    title = str(page)
-                    desc = "No description available"
-                    
-                st.markdown(f"### {title}")
-                st.write(desc)
+                url = result.get("url", "No URL")
+                title = result.get("metadata", {}).get("title", "No Title")
+                st.markdown(f"**{title}**")
+                st.markdown(f"🔗 [{url}]({url})")
             with col2:
-                if st.button("View Details", key=f"view_{title}"):
-                    st.session_state.selected_page = page
-            st.divider()
-else:
-    st.info("No pages have been scraped yet. Use the sidebar to start scraping.")
-
-# Session Management
-st.sidebar.header("Session Management")
-
-# Session selector
-session_files = get_session_files()
-if session_files:
-    selected_session = st.sidebar.selectbox(
-        "Load Previous Session",
-        session_files,
-        index=None,
-        placeholder="Choose a session...",
-        format_func=lambda x: x.replace('scraped_', '').replace('.json', '').replace('_', ' ')
-    )
-    
-    if selected_session and selected_session != st.session_state.current_session:
-        if load_session(selected_session):
-            st.sidebar.success(f"Loaded session: {selected_session}")
-
-# Show current session
-if st.session_state.current_session:
-    st.sidebar.info(f"Current session: {st.session_state.current_session}")
-
-# File Upload Section
-st.subheader("Load Existing Results")
-uploaded_file = st.file_uploader("Upload JSON results file", type=['json'])
-
-if uploaded_file:
-    try:
-        json_data = json.load(uploaded_file)
-        st.session_state.results = json_data
-        st.success(f"Loaded {len(json_data['pages'])} scraped pages from file")
-    except Exception as e:
-        st.error(f"Error loading JSON file: {str(e)}")
-
-# URL Input
-st.subheader("Input URLs")
-urls_text = st.text_area(
-    "Enter URLs (one per line)",
-    height=150,
-    help="Enter the URLs you want to scrape, one per line"
-)
-
-# Process URLs button
-if st.button("Process URLs", disabled=st.session_state.is_scraping):
-    valid_urls, invalid_urls = process_urls(urls_text)
-    st.session_state.urls = valid_urls
-    
-    if invalid_urls:
-        st.error(f"Found {len(invalid_urls)} invalid URLs:\n" + "\n".join(invalid_urls))
-    
-    if valid_urls:
-        st.success(f"Loaded {len(valid_urls)} valid URLs")
-
-# Display number of loaded URLs
-if st.session_state.urls:
-    st.info(f"URLs loaded: {len(st.session_state.urls)}")
-
-# Scraping section
-if st.session_state.urls:
-    st.subheader("Scraping")
-    
-    # Add screenshot option checkbox
-    take_screenshots = st.checkbox("Take screenshots", value=True, help="Enable to capture screenshots of pages (takes longer)")
-    
-    if st.button("Start Scraping", disabled=st.session_state.is_scraping):
-        st.session_state.is_scraping = True
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        try:
-            results, results_file = run_scraper(st.session_state.urls, progress_bar, status_text, take_screenshots)
-            st.session_state.results = results  # Update results in session state
-            st.success("Scraping completed successfully!")
-            st.rerun()  # Force a rerun to ensure the UI updates properly
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-        finally:
-            st.session_state.is_scraping = False
-
-# Results section
-if st.session_state.results:
-    st.subheader("Results")
-    
-    # Quick search
-    search = st.text_input("🔍 Quick search in titles", key="quick_search")
-    
-    # Get pages from results
-    results = st.session_state.results
-    if isinstance(results, dict):
-        pages = results.get("pages", [])
-    else:
-        pages = results if isinstance(results, list) else []
-        
-    # Filter pages based on search
-    if search:
-        search = search.lower()
-        filtered_pages = []
-        for page in pages:
-            if isinstance(page, dict):
-                title = page.get("metadata", {}).get("title", "") or page.get("url", "")
-            else:
-                title = str(page)
-            if search in title.lower():
-                filtered_pages.append(page)
-        st.info(f"Found {len(filtered_pages)} matching results")
-    else:
-        filtered_pages = pages
-    
-    # Display list of titles with links to detail pages
-    for page in filtered_pages:
-        if isinstance(page, dict):
-            title = page.get("metadata", {}).get("title", "") or page.get("url", "")
-            status = page.get("status", {})
-            success = status.get("success", False) if isinstance(status, dict) else False
-            status_emoji = "✅" if success else "❌"
-        else:
-            title = str(page)
-            status_emoji = "❓"
-        
-        # Create a clickable link with the title
-        if st.button(f"{status_emoji} {title}", key=f"btn_{title}"):
-            st.session_state.selected_page = page
-    
-    # Simple download button
-    st.download_button(
-        label="📥 Download JSON",
-        data=json.dumps(st.session_state.results, ensure_ascii=False, indent=2),
-        file_name=f"scraped_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
+                if st.button("View Details", key=f"view_{url}"):
+                    st.session_state.selected_page = result
 
 # Display selected page details
 if st.session_state.get('selected_page'):

@@ -320,56 +320,105 @@ class EnhancedWebScraper:
             return None
 
     def analyze_content(self, url: str, html_content: str, metadata: Dict) -> Dict:
-        """Analyze content using OpenAI API with rate limiting."""
-        if not self.client or not self.assistant_id:
-            return {"error": "OpenAI client not initialized"}
-            
+        """Analyze content using Claude API."""
         try:
-            # Create a thread
-            thread = self.client.beta.threads.create()
+            import anthropic
             
-            # Add the content as a message
-            self.client.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=html_content
-            )
+            # Initialize Claude client
+            client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
             
-            # Run the assistant
-            run = self.client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=self.assistant_id
-            )
-            
-            # Poll for completion with delay
-            while True:
-                run_status = self.client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-                
-                if run_status.status == 'completed':
-                    break
-                elif run_status.status == 'failed':
-                    return {"error": "Analysis failed"}
-                    
-                time.sleep(1)  # Add delay between polls
-            
-            # Get the response
-            messages = self.client.beta.threads.messages.list(
-                thread_id=thread.id
-            )
-            
-            # Clean up
-            self.client.beta.threads.delete(thread.id)
-            
-            return {"analysis": messages.data[0].content[0].text.value}
-            
-        except Exception as e:
-            logger.error(f"Error in content analysis: {str(e)}")
-            return {"error": str(e)}
+            # Format the message with metadata and request
+            message_content = f"""Please analyze this webpage content:
 
-    def scrape_url(self, url: str, take_screenshots: bool = True) -> Dict:
+URL: {url}
+Title: {metadata.get('title', 'N/A')}
+Description: {metadata.get('description', 'N/A')}
+Keywords: {metadata.get('keywords', 'N/A')}
+Author: {metadata.get('author', 'N/A')}
+Language: {metadata.get('language', 'N/A')}
+Robots: {metadata.get('robots', 'N/A')}
+Canonical URL: {metadata.get('canonical', 'N/A')}
+Viewport: {metadata.get('viewport', 'N/A')}
+
+Link Information:
+{json.dumps([{
+    'url': link.get('url', ''),
+    'anchor_text': link.get('anchor_text', ''),
+    'is_internal': link.get('is_internal', False)
+} for link in metadata.get('links', [])], indent=2)}
+
+Structured Data:
+Schema.org: {json.dumps(metadata.get('structured_data', {}).get('schema_org', []), indent=2)}
+Open Graph: {json.dumps(metadata.get('structured_data', {}).get('open_graph', []), indent=2)}
+Twitter Cards: {json.dumps(metadata.get('structured_data', {}).get('twitter_cards', {}), indent=2)}
+Microdata: {json.dumps(metadata.get('structured_data', {}).get('microdata', []), indent=2)}
+RDFa: {json.dumps(metadata.get('structured_data', {}).get('rdfa', []), indent=2)}
+JSON-LD: {json.dumps(metadata.get('structured_data', {}).get('json_ld', []), indent=2)}
+
+Content:
+{html_content}
+
+Please provide a detailed analysis of the page content, including:
+1. Main topics and themes
+2. Key information and important points
+3. Content quality and structure
+4. SEO analysis (meta tags, headings, etc.)
+5. Technical aspects (load time, page size, etc.)
+6. Content organization (headings, paragraphs, etc.)
+7. Media usage (images, their context and relevance)
+8. Link structure and navigation
+9. Any notable patterns or issues
+10. Recommendations for improvement
+
+Please format your response as a JSON object with the following structure:
+{
+    "summary": "Brief summary of the page content",
+    "target_audience": "Description of the target audience",
+    "key_takeaways": ["List of key points"],
+    "seo_analysis": "Analysis of SEO elements",
+    "technical_analysis": "Analysis of technical aspects",
+    "content_quality": "Analysis of content quality",
+    "recommendations": ["List of improvement recommendations"]
+}"""
+            
+            # Create message with Claude
+            message = client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=4000,
+                temperature=0.7,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": message_content
+                    }
+                ]
+            )
+            
+            # Extract the response
+            response_text = message.content[0].text
+            
+            try:
+                # Try to parse as JSON
+                analysis_data = json.loads(response_text)
+                return {
+                    "raw_analysis": analysis_data,
+                    "status": "success"
+                }
+            except json.JSONDecodeError:
+                # If not JSON, return as plain text
+                return {
+                    "raw_analysis": response_text,
+                    "status": "success"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error during content analysis: {str(e)}")
+            return {
+                "error": str(e),
+                "status": "error"
+            }
+
+    def scrape_url(self, url: str, take_screenshots: bool = True, analyze_content: bool = True) -> Dict:
         """Enhanced scraping with comprehensive data extraction and safety measures."""
         try:
             # Check robots.txt first
@@ -390,22 +439,25 @@ class EnhancedWebScraper:
             headers = self.get_request_headers(url)
             
             # Take screenshots first (with error handling)
-            screenshots = {}
+            screenshots = {
+                "status": "disabled",
+                "message": "Screenshots were disabled for this scrape"
+            }
             if take_screenshots:
                 try:
                     logger.info("Taking screenshots...")
                     screenshots = self.screenshot_manager.take_screenshots(url)
+                    if not screenshots.get("status"):
+                        screenshots["status"] = "success"
+                    if not screenshots.get("paths"):
+                        screenshots["paths"] = {}
                 except Exception as e:
                     logger.warning(f"Failed to take screenshots: {str(e)}")
                     screenshots = {
                         "error": str(e),
-                        "status": "failed"
+                        "status": "failed",
+                        "paths": {}
                     }
-            else:
-                screenshots = {
-                    "status": "disabled",
-                    "message": "Screenshots were disabled for this scrape"
-                }
             
             # Fetch page with updated headers
             try:
@@ -437,18 +489,66 @@ class EnhancedWebScraper:
             soup = BeautifulSoup(response.text, 'html.parser')
             self.base_url = url
 
-            # Basic metadata
-            metadata = {
-                'title': soup.title.string.strip() if soup.title else None,
-                'description': soup.find('meta', {'name': 'description'})['content'] if soup.find('meta', {'name': 'description'}) else None,
-                'robots': soup.find('meta', {'name': 'robots'})['content'] if soup.find('meta', {'name': 'robots'}) else None,
-                'keywords': soup.find('meta', {'name': 'keywords'})['content'] if soup.find('meta', {'name': 'keywords'}) else None,
-                'author': soup.find('meta', {'name': 'author'})['content'] if soup.find('meta', {'name': 'author'}) else None,
-                'language': soup.find('html').get('lang') if soup.find('html') else None,
-                'canonical': soup.find('link', {'rel': 'canonical'})['href'] if soup.find('link', {'rel': 'canonical'}) else None,
-                'hreflang': [{'href': tag['href'], 'lang': tag['hreflang']} for tag in soup.find_all('link', {'rel': 'alternate', 'hreflang': True})],
-                'viewport': soup.find('meta', {'name': 'viewport'})['content'] if soup.find('meta', {'name': 'viewport'}) else None,
-            }
+            # Basic metadata with safer extraction
+            try:
+                # Get title with proper encoding
+                title = soup.title.string.strip() if soup.title else None
+                if title:
+                    title = title.encode('utf-8', errors='ignore').decode('utf-8')
+
+                # Get meta tags with proper encoding
+                description = soup.find('meta', {'name': 'description'})
+                description = description.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if description else None
+
+                robots = soup.find('meta', {'name': 'robots'})
+                robots = robots.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if robots else None
+
+                keywords = soup.find('meta', {'name': 'keywords'})
+                keywords = keywords.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if keywords else None
+
+                author = soup.find('meta', {'name': 'author'})
+                author = author.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if author else None
+
+                language = soup.find('html').get('lang') if soup.find('html') else None
+                if language:
+                    language = language.encode('utf-8', errors='ignore').decode('utf-8')
+
+                canonical = soup.find('link', {'rel': 'canonical'})
+                canonical = canonical.get('href', '').encode('utf-8', errors='ignore').decode('utf-8') if canonical else None
+
+                viewport = soup.find('meta', {'name': 'viewport'})
+                viewport = viewport.get('content', '').encode('utf-8', errors='ignore').decode('utf-8') if viewport else None
+
+                hreflang = []
+                for tag in soup.find_all('link', {'rel': 'alternate', 'hreflang': True}):
+                    href = tag.get('href', '').encode('utf-8', errors='ignore').decode('utf-8')
+                    lang = tag.get('hreflang', '').encode('utf-8', errors='ignore').decode('utf-8')
+                    hreflang.append({'href': href, 'lang': lang})
+
+                metadata = {
+                    'title': title,
+                    'description': description,
+                    'robots': robots,
+                    'keywords': keywords,
+                    'author': author,
+                    'language': language,
+                    'canonical': canonical,
+                    'viewport': viewport,
+                    'hreflang': hreflang
+                }
+            except Exception as e:
+                logger.error(f"Error extracting metadata: {str(e)}")
+                metadata = {
+                    'title': None,
+                    'description': None,
+                    'robots': None,
+                    'keywords': None,
+                    'author': None,
+                    'language': None,
+                    'canonical': None,
+                    'viewport': None,
+                    'hreflang': []
+                }
 
             # Extract headings
             headings = []
@@ -492,16 +592,63 @@ class EnhancedWebScraper:
                 'stylesheets': [css['href'] for css in soup.find_all('link', rel='stylesheet')],
             }
 
+            # Extract main content with better cleaning
+            try:
+                # Remove unwanted elements
+                for element in soup.find_all(['script', 'style', 'nav', 'footer', 'header']):
+                    element.decompose()
+                
+                # Get the main content
+                main_content = soup.find('main') or soup.find('article') or soup.find('div', {'class': 'content'}) or soup.find('body')
+                if main_content:
+                    content_text = main_content.get_text(separator=' ', strip=True)
+                else:
+                    content_text = soup.get_text(separator=' ', strip=True)
+                
+                # Clean the text and handle encoding
+                content_text = re.sub(r'\s+', ' ', content_text)  # Replace multiple spaces with single space
+                content_text = content_text.strip()
+                
+                # Ensure proper encoding for Hebrew text
+                content_text = content_text.encode('utf-8', errors='ignore').decode('utf-8')
+                
+                # Count words
+                word_count = len(content_text.split())
+                
+                content = {
+                    "clean_text": content_text,
+                    "word_count": word_count
+                }
+            except Exception as e:
+                logger.error(f"Error extracting content: {str(e)}")
+                content = {
+                    "clean_text": "",
+                    "word_count": 0
+                }
+
+            # Content analysis with better error handling
+            analysis = {}
+            if analyze_content and content.get("clean_text"):
+                try:
+                    analysis = self.analyze_content(url, content["clean_text"], metadata)
+                except Exception as e:
+                    logger.error(f"Error during content analysis: {str(e)}")
+                    analysis = {
+                        "error": str(e),
+                        "status": "error"
+                    }
+            else:
+                analysis = {
+                    "status": "disabled",
+                    "message": "Content analysis was disabled for this scrape"
+                }
+
             # Create the enhanced page data structure
             page_data = {
                 "url": url,
                 "scrape_timestamp": datetime.now().isoformat(),
                 "metadata": metadata,
-                "content": {
-                    "full_html": response.text,
-                    "clean_text": ' '.join([p.get_text(strip=True) for p in soup.find_all('p')]),
-                    "word_count": len(response.text.split()),
-                },
+                "content": content,
                 "headings": [asdict(h) for h in headings],
                 "images": [asdict(img) for img in images],
                 "links": [asdict(link) for link in links],
@@ -512,15 +659,8 @@ class EnhancedWebScraper:
                     "message": "Successfully scraped"
                 },
                 "screenshots": screenshots,
-                "analysis": {
-                    "raw_analysis": "Content analysis not available. OpenAI client not initialized."
-                }
+                "analysis": analysis
             }
-
-            # Analyze content using OpenAI if client is available
-            if self.client:
-                content_analysis = self.analyze_content(url, response.text, metadata)
-                page_data["analysis"] = content_analysis
 
             logger.info(f"✓ Successfully scraped {url}")
             return page_data
